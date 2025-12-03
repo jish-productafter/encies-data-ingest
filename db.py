@@ -67,6 +67,7 @@ def insert_token_price_changes(token_price_changes: List[TokenPriceChange]) -> N
         )
         for item in token_price_changes
     ]
+    print(data)
 
     data = client.execute(
         "INSERT INTO polymarket.token_price_changes (slug, outcome, price, side, timestamp) VALUES",
@@ -96,6 +97,7 @@ def insert_exchange_price_changes(
         (item["symbol"], item["timestamp"], item["price"])
         for item in exchange_price_changes
     ]
+    print(data)
     data = client.execute(
         "INSERT INTO polymarket.exchange_price_changes (symbol, timestamp, price) VALUES",
         data,

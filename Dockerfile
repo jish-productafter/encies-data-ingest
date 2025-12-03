@@ -21,3 +21,5 @@ ENV PYTHONPATH=/app
 # Run the service
 CMD ["python", "main.py"]
 
+
+

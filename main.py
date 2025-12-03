@@ -5,6 +5,7 @@ Main entry point for Polymarket real-time data monitoring.
 import asyncio
 import json
 import signal
+from datetime import datetime
 from typing import Dict, List, Optional
 from src.api import get_polymarket_events
 from src.client import RealTimeDataClient
@@ -37,7 +38,6 @@ def on_message(_: RealTimeDataClient, message: Message) -> None:
                 topic=message["topic"],
                 type=message["type"],
             )
-            print(json.dumps(message, indent=2))
             arr: List[ExchangePriceChange] = []
             for item in message["payload"]["data"]:
                 arr.append(
@@ -81,15 +81,7 @@ def on_message(_: RealTimeDataClient, message: Message) -> None:
                     sell_price = pc["bb"]
                     side = pc["si"]
                     price = float(buy_price) if side == "BUY" else float(sell_price)
-                    print(
-                        TokenPriceChange(
-                            slug=slug,
-                            outcome=outcome,
-                            price=price,
-                            side=side,
-                            timestamp=timestamp,
-                        )
-                    )
+                  
                     insert_token_price_changes(
                         [
                             TokenPriceChange(
@@ -239,27 +231,94 @@ async def refresh_and_reconnect() -> None:
         print(f"Error during refresh and reconnect: {error}")
 
 
+def is_in_active_window() -> bool:
+    """
+    Check if current time is in the active monitoring window (12th to 18th minute).
+
+    Returns:
+        True if current minute is between 12 and 18 (inclusive)
+    """
+    current_minute = datetime.now().minute
+    return 12 <= current_minute <= 18
+
+
 async def periodic_refresh() -> None:
-    """Periodically refreshes markets and reconnects."""
-    REFRESH_INTERVAL_SECONDS = 10 * 60  # 10 minutes
+    """
+    Periodically refreshes markets and reconnects based on time windows.
+    - During minutes 12-18: Keep service running (no refresh, just monitor)
+    - After minute 18: Fetch new events and refresh, then continue running
+    - Before minute 12: Keep service running, wait for active window
+    """
+    CHECK_INTERVAL_SECONDS = 60  # Check every minute
+    last_refresh_minute = -1  # Track when we last refreshed to avoid multiple refreshes
 
     while True:
-        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
-        await refresh_and_reconnect()
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+        current_minute = datetime.now().minute
+        current_time = datetime.now().strftime("%H:%M:%S")
+
+        if is_in_active_window():
+            # During active window (12-18), just keep monitoring
+            print(
+                f"[{current_time}] In active monitoring window (minute {current_minute}). Service running..."
+            )
+            last_refresh_minute = -1  # Reset refresh tracking
+        elif current_minute > 18:
+            # After minute 18, fetch new events and refresh (only once per cycle)
+            if last_refresh_minute != current_minute:
+                print(
+                    f"[{current_time}] After active window (minute {current_minute}). Fetching new events and refreshing..."
+                )
+                await refresh_and_reconnect()
+                last_refresh_minute = current_minute
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] Refresh complete. Service continues running..."
+                )
+        else:
+            # Before minute 12, keep service running and wait for active window
+            if current_minute != last_refresh_minute:
+                print(
+                    f"[{current_time}] Before active window (minute {current_minute}). Service running, waiting for active window (12-18)..."
+                )
+                last_refresh_minute = current_minute
 
 
 async def main() -> None:
     """Main entry point."""
     global current_client, refresh_interval_task
 
+    current_time = datetime.now().strftime("%H:%M:%S")
+    current_minute = datetime.now().minute
+
+    print(f"[{current_time}] Starting Polymarket monitoring service...")
+    print(f"[{current_time}] Active monitoring window: minutes 12-18 of each hour")
+    print(f"[{current_time}] Service will refresh events after minute 18 of each hour")
+
     # Initial connection
     token_ids = await fetch_markets_and_token_ids()
     subscriptions = build_subscriptions(token_ids)
     current_client = await connect_websocket(subscriptions)
 
+    # If we're after minute 18, fetch new events immediately
+    if current_minute > 18:
+        print(
+            f"[{current_time}] After active window. Fetching new events and refreshing..."
+        )
+        await refresh_and_reconnect()
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Initial refresh complete.")
+    elif is_in_active_window():
+        print(
+            f"[{current_time}] Currently in active monitoring window. Service running..."
+        )
+    else:
+        print(
+            f"[{current_time}] Before active window. Service will start monitoring at minute 12..."
+        )
+
     # Set up periodic refresh task
     refresh_interval_task = asyncio.create_task(periodic_refresh())
-    print("Market refresh scheduled every 10 minutes")
+    print("Time-based refresh scheduler started. Service will run continuously.")
 
     # Keep the event loop running
     try:
