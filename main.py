@@ -22,6 +22,78 @@ from db import insert_token_price_changes, insert_exchange_price_changes
 
 token_id_to_outcome_map: Dict[str, str] = {}
 
+# Batch insert buffers
+exchange_price_buffer: List[ExchangePriceChange] = []
+token_price_buffer: List[TokenPriceChange] = []
+BATCH_SIZE = 100  # Insert when buffer reaches this size
+FLUSH_INTERVAL_SECONDS = 5  # Flush buffers every N seconds
+batch_lock = asyncio.Lock()  # Lock for thread-safe buffer operations
+
+
+async def flush_exchange_price_buffer() -> None:
+    """Flush exchange price buffer to database."""
+    global exchange_price_buffer
+    async with batch_lock:
+        if exchange_price_buffer:
+            items_to_insert = exchange_price_buffer.copy()
+            exchange_price_buffer.clear()
+            if items_to_insert:
+                insert_exchange_price_changes(items_to_insert)
+                print(
+                    f"Flushed {len(items_to_insert)} exchange price changes to database"
+                )
+
+
+async def flush_token_price_buffer() -> None:
+    """Flush token price buffer to database."""
+    global token_price_buffer
+    async with batch_lock:
+        if token_price_buffer:
+            items_to_insert = token_price_buffer.copy()
+            token_price_buffer.clear()
+            if items_to_insert:
+                insert_token_price_changes(items_to_insert)
+                print(f"Flushed {len(items_to_insert)} token price changes to database")
+
+
+async def flush_all_buffers() -> None:
+    """Flush all buffers to database."""
+    await flush_exchange_price_buffer()
+    await flush_token_price_buffer()
+
+
+async def add_to_exchange_price_buffer(items: List[ExchangePriceChange]) -> None:
+    """Add items to exchange price buffer and flush if threshold reached."""
+    global exchange_price_buffer
+    async with batch_lock:
+        exchange_price_buffer.extend(items)
+        if len(exchange_price_buffer) >= BATCH_SIZE:
+            items_to_insert = exchange_price_buffer.copy()
+            exchange_price_buffer.clear()
+            if items_to_insert:
+                insert_exchange_price_changes(items_to_insert)
+                print(f"Batch inserted {len(items_to_insert)} exchange price changes")
+
+
+async def add_to_token_price_buffer(items: List[TokenPriceChange]) -> None:
+    """Add items to token price buffer and flush if threshold reached."""
+    global token_price_buffer
+    async with batch_lock:
+        token_price_buffer.extend(items)
+        if len(token_price_buffer) >= BATCH_SIZE:
+            items_to_insert = token_price_buffer.copy()
+            token_price_buffer.clear()
+            if items_to_insert:
+                insert_token_price_changes(items_to_insert)
+                print(f"Batch inserted {len(items_to_insert)} token price changes")
+
+
+async def periodic_buffer_flush() -> None:
+    """Periodically flush buffers to database."""
+    while True:
+        await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
+        await flush_all_buffers()
+
 
 def on_message(_: RealTimeDataClient, message: Message) -> None:
     """Handle incoming WebSocket messages."""
@@ -47,7 +119,12 @@ def on_message(_: RealTimeDataClient, message: Message) -> None:
                         price=item["value"],
                     )
                 )
-            insert_exchange_price_changes(arr)
+            # Add to buffer instead of inserting immediately
+            try:
+                asyncio.create_task(add_to_exchange_price_buffer(arr))
+            except (RuntimeError, AttributeError):
+                # Fallback: insert directly if no event loop is available
+                insert_exchange_price_changes(arr)
     elif message["topic"] == "crypto_prices_chainlink" and message["type"] == "update":
         message = CryptoPricesChainlinkUpdateMessage(
             payload=message["payload"],
@@ -62,7 +139,12 @@ def on_message(_: RealTimeDataClient, message: Message) -> None:
                 price=message["payload"]["value"],
             )
         ]
-        insert_exchange_price_changes(arr)
+        # Add to buffer instead of inserting immediately
+        try:
+            asyncio.create_task(add_to_exchange_price_buffer(arr))
+        except (RuntimeError, AttributeError):
+            # Fallback: insert directly if no event loop is available
+            insert_exchange_price_changes(arr)
 
     elif message["topic"] == "clob_market":
         pass
@@ -73,6 +155,7 @@ def on_message(_: RealTimeDataClient, message: Message) -> None:
             price_change_message = message  # type: ClobMarketPriceChangeMessage
             # console.log(JSON.stringify(priceChangeMessage, null, 2))
             timestamp = int(price_change_message["payload"]["t"])
+            token_changes: List[TokenPriceChange] = []
             for pc in price_change_message["payload"]["pc"]:
                 slug_and_outcome = token_id_to_outcome_map.get(pc["a"])
                 if slug_and_outcome:
@@ -81,22 +164,28 @@ def on_message(_: RealTimeDataClient, message: Message) -> None:
                     sell_price = pc["bb"]
                     side = pc["si"]
                     price = float(buy_price) if side == "BUY" else float(sell_price)
-                  
-                    insert_token_price_changes(
-                        [
-                            TokenPriceChange(
-                                slug=slug,
-                                outcome=outcome,
-                                price=price,
-                                side=side,
-                                timestamp=timestamp,
-                            )
-                        ]
+
+                    token_changes.append(
+                        TokenPriceChange(
+                            slug=slug,
+                            outcome=outcome,
+                            price=price,
+                            side=side,
+                            timestamp=timestamp,
+                        )
                     )
+            # Add all items to buffer instead of inserting immediately
+            if token_changes:
+                try:
+                    asyncio.create_task(add_to_token_price_buffer(token_changes))
+                except (RuntimeError, AttributeError):
+                    # Fallback: insert directly if no event loop is available
+                    insert_token_price_changes(token_changes)
 
 
 current_client: Optional[RealTimeDataClient] = None
 refresh_interval_task: Optional[asyncio.Task] = None
+buffer_flush_task: Optional[asyncio.Task] = None
 
 
 async def fetch_markets_and_token_ids() -> List[str]:
@@ -208,6 +297,21 @@ async def disconnect_current_client() -> None:
         await asyncio.sleep(1)
 
 
+async def stop_buffer_flush() -> None:
+    """Stop the periodic buffer flush task and flush remaining buffers."""
+    global buffer_flush_task
+    if buffer_flush_task:
+        buffer_flush_task.cancel()
+        try:
+            await buffer_flush_task
+        except asyncio.CancelledError:
+            pass
+        buffer_flush_task = None
+    # Flush any remaining items in buffers
+    await flush_all_buffers()
+    print("All buffers flushed")
+
+
 async def refresh_and_reconnect() -> None:
     """Refreshes markets and reconnects WebSocket."""
     try:
@@ -286,7 +390,7 @@ async def periodic_refresh() -> None:
 
 async def main() -> None:
     """Main entry point."""
-    global current_client, refresh_interval_task
+    global current_client, refresh_interval_task, buffer_flush_task
 
     current_time = datetime.now().strftime("%H:%M:%S")
     current_minute = datetime.now().minute
@@ -294,6 +398,9 @@ async def main() -> None:
     print(f"[{current_time}] Starting Polymarket monitoring service...")
     print(f"[{current_time}] Active monitoring window: minutes 12-18 of each hour")
     print(f"[{current_time}] Service will refresh events after minute 18 of each hour")
+    print(
+        f"[{current_time}] Batch insert enabled: batch size={BATCH_SIZE}, flush interval={FLUSH_INTERVAL_SECONDS}s"
+    )
 
     # Initial connection
     token_ids = await fetch_markets_and_token_ids()
@@ -320,6 +427,10 @@ async def main() -> None:
     refresh_interval_task = asyncio.create_task(periodic_refresh())
     print("Time-based refresh scheduler started. Service will run continuously.")
 
+    # Set up periodic buffer flush task
+    buffer_flush_task = asyncio.create_task(periodic_buffer_flush())
+    print("Periodic buffer flush task started.")
+
     # Keep the event loop running
     try:
         # Wait for the refresh task (which runs indefinitely)
@@ -327,6 +438,7 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        await stop_buffer_flush()
         if current_client:
             await disconnect_current_client()
 
@@ -334,16 +446,18 @@ async def main() -> None:
 def signal_handler(sig, frame):
     """Handle shutdown signals."""
     print("\nShutting down gracefully...")
-    global refresh_interval_task, current_client
+    global refresh_interval_task, current_client, buffer_flush_task
 
     if refresh_interval_task:
         refresh_interval_task.cancel()
 
-    # Schedule disconnect in the event loop
+    # Schedule buffer flush and disconnect in the event loop
     loop = asyncio.get_event_loop()
     if loop.is_running():
+        asyncio.create_task(stop_buffer_flush())
         asyncio.create_task(disconnect_current_client())
     else:
+        loop.run_until_complete(stop_buffer_flush())
         loop.run_until_complete(disconnect_current_client())
 
 
@@ -357,5 +471,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nShutting down gracefully...")
     finally:
+        # Flush any remaining buffers before exit
+        asyncio.run(flush_all_buffers())
         if current_client:
             asyncio.run(disconnect_current_client())
