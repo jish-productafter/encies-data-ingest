@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  polymarket-monitor:
+    build: .
+    container_name: polymarket-monitor
+    restart: unless-stopped
+    environment:
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
+    env_file:
+      - .env
+    volumes:
+      # Optional: mount logs directory if you want to persist logs
+      - ./logs:/app/logs
+    # Keep container running
+    stdin_open: true
+    tty: true
+
