@@ -22,7 +22,7 @@ def find_env_file():
     return Path.cwd() / ".env", Path.cwd()
 
 
-env_path, project_root = find_env_file()
+env_path, project_root = find_env_file()    
 
 # Load .env file with explicit path
 load_dotenv(dotenv_path=env_path, override=True)

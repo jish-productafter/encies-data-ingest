@@ -5,7 +5,7 @@ Main entry point for Polymarket real-time data monitoring.
 import asyncio
 import json
 import signal
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from src.api import get_polymarket_events
 from src.client import RealTimeDataClient
@@ -196,7 +196,7 @@ async def fetch_markets_and_token_ids() -> List[str]:
         List of unique token IDs
     """
     print("Fetching active markets...")
-    markets = get_polymarket_events(False, 8, True)
+    markets = get_polymarket_events(False, 16, True)
     # get only btc markets
     btc_markets = [market for market in markets if "btc" in market.slug.lower()]
 
@@ -335,57 +335,74 @@ async def refresh_and_reconnect() -> None:
         print(f"Error during refresh and reconnect: {error}")
 
 
-def is_in_active_window() -> bool:
-    """
-    Check if current time is in the active monitoring window (12th to 18th minute).
-
-    Returns:
-        True if current minute is between 12 and 18 (inclusive)
-    """
-    current_minute = datetime.now().minute
-    return 12 <= current_minute <= 18
-
-
 async def periodic_refresh() -> None:
     """
-    Periodically refreshes markets and reconnects based on time windows.
-    - During minutes 12-18: Keep service running (no refresh, just monitor)
-    - After minute 18: Fetch new events and refresh, then continue running
-    - Before minute 12: Keep service running, wait for active window
+    Periodically refreshes markets and reconnects at 7.5 minutes after each 15-minute market start.
+    Markets start at: 00, 15, 30, 45 minutes of each hour
+    Refresh happens at: 07:30, 22:30, 37:30, 52:30 of each hour
     """
-    CHECK_INTERVAL_SECONDS = 60  # Check every minute
-    last_refresh_minute = -1  # Track when we last refreshed to avoid multiple refreshes
+
+    def get_next_refresh_time() -> datetime:
+        """
+        Calculate the next refresh time (7.5 minutes after the next market start).
+        Market starts at: 00, 15, 30, 45 minutes of each hour
+        Refresh at: 07:30, 22:30, 37:30, 52:30 of each hour
+        """
+        now = datetime.now()
+        current_minute = now.minute
+        current_second = now.second
+
+        # Determine which market period we're in and find the next refresh time
+        # Market periods: 00-15, 15-30, 30-45, 45-60
+        # Refresh times: 07:30, 22:30, 37:30, 52:30
+
+        if current_minute < 7 or (current_minute == 7 and current_second < 30):
+            # Before 07:30, next refresh is at 07:30
+            next_refresh = now.replace(minute=7, second=30, microsecond=0)
+        elif current_minute < 22 or (current_minute == 22 and current_second < 30):
+            # Before 22:30, next refresh is at 22:30
+            next_refresh = now.replace(minute=22, second=30, microsecond=0)
+        elif current_minute < 37 or (current_minute == 37 and current_second < 30):
+            # Before 37:30, next refresh is at 37:30
+            next_refresh = now.replace(minute=37, second=30, microsecond=0)
+        elif current_minute < 52 or (current_minute == 52 and current_second < 30):
+            # Before 52:30, next refresh is at 52:30
+            next_refresh = now.replace(minute=52, second=30, microsecond=0)
+        else:
+            # After 52:30, next refresh is at 07:30 of next hour
+            next_refresh = (now + timedelta(hours=1)).replace(
+                minute=7, second=30, microsecond=0
+            )
+
+        return next_refresh
 
     while True:
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+        now = datetime.now()
+        next_refresh_time = get_next_refresh_time()
+        wait_seconds = (next_refresh_time - now).total_seconds()
 
-        current_minute = datetime.now().minute
-        current_time = datetime.now().strftime("%H:%M:%S")
+        # Ensure we wait at least a small amount to avoid immediate execution
+        if wait_seconds < 0:
+            # If we somehow missed the time, recalculate
+            next_refresh_time = get_next_refresh_time()
+            wait_seconds = (next_refresh_time - now).total_seconds()
 
-        if is_in_active_window():
-            # During active window (12-18), just keep monitoring
+        if wait_seconds > 0:
+            current_time_str = now.strftime("%H:%M:%S")
+            next_refresh_str = next_refresh_time.strftime("%H:%M:%S")
             print(
-                f"[{current_time}] In active monitoring window (minute {current_minute}). Service running..."
+                f"[{current_time_str}] Next refresh scheduled at {next_refresh_str} "
+                f"(in {wait_seconds:.1f} seconds)"
             )
-            last_refresh_minute = -1  # Reset refresh tracking
-        elif current_minute > 18:
-            # After minute 18, fetch new events and refresh (only once per cycle)
-            if last_refresh_minute != current_minute:
-                print(
-                    f"[{current_time}] After active window (minute {current_minute}). Fetching new events and refreshing..."
-                )
-                await refresh_and_reconnect()
-                last_refresh_minute = current_minute
-                print(
-                    f"[{datetime.now().strftime('%H:%M:%S')}] Refresh complete. Service continues running..."
-                )
-        else:
-            # Before minute 12, keep service running and wait for active window
-            if current_minute != last_refresh_minute:
-                print(
-                    f"[{current_time}] Before active window (minute {current_minute}). Service running, waiting for active window (12-18)..."
-                )
-                last_refresh_minute = current_minute
+            await asyncio.sleep(wait_seconds)
+
+        # Perform the refresh
+        refresh_time = datetime.now().strftime("%H:%M:%S")
+        print(
+            f"[{refresh_time}] Performing scheduled refresh (7.5 minutes after market start)..."
+        )
+        await refresh_and_reconnect()
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Refresh complete.")
 
 
 async def main() -> None:
@@ -393,11 +410,12 @@ async def main() -> None:
     global current_client, refresh_interval_task, buffer_flush_task
 
     current_time = datetime.now().strftime("%H:%M:%S")
-    current_minute = datetime.now().minute
 
     print(f"[{current_time}] Starting Polymarket monitoring service...")
-    print(f"[{current_time}] Active monitoring window: minutes 12-18 of each hour")
-    print(f"[{current_time}] Service will refresh events after minute 18 of each hour")
+    print(
+        f"[{current_time}] Refresh schedule: Every 15 minutes at 7.5 minutes after market start"
+    )
+    print(f"[{current_time}] Refresh times: 07:30, 22:30, 37:30, 52:30 of each hour")
     print(
         f"[{current_time}] Batch insert enabled: batch size={BATCH_SIZE}, flush interval={FLUSH_INTERVAL_SECONDS}s"
     )
@@ -406,22 +424,7 @@ async def main() -> None:
     token_ids = await fetch_markets_and_token_ids()
     subscriptions = build_subscriptions(token_ids)
     current_client = await connect_websocket(subscriptions)
-
-    # If we're after minute 18, fetch new events immediately
-    if current_minute > 18:
-        print(
-            f"[{current_time}] After active window. Fetching new events and refreshing..."
-        )
-        await refresh_and_reconnect()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Initial refresh complete.")
-    elif is_in_active_window():
-        print(
-            f"[{current_time}] Currently in active monitoring window. Service running..."
-        )
-    else:
-        print(
-            f"[{current_time}] Before active window. Service will start monitoring at minute 12..."
-        )
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Initial connection established.")
 
     # Set up periodic refresh task
     refresh_interval_task = asyncio.create_task(periodic_refresh())
